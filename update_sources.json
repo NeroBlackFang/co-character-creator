@@ -1,0 +1,9 @@
+{
+  "_comment": "Where updater.py looks for latest.json, tried in this order. Entries still holding a {placeholder} are skipped. publish_release.py uploads latest.json and the installer to each.",
+  "manifests": [
+    {"name": "GitHub", "url": "https://github.com/NeroBlackFang/co-character-creator/releases/latest/download/latest.json"},
+    {"name": "GitHub (repository)", "url": "https://raw.githubusercontent.com/NeroBlackFang/co-character-creator/main/latest.json"},
+    {"name": "Codeberg", "url": "https://codeberg.org/{codeberg_owner}/co-character-creator/raw/branch/main/latest.json"},
+    {"name": "Google Drive", "url": "https://drive.usercontent.google.com/download?id=1r-xF_CYejoJOThirFw-3IaiOOIbsWODc&export=download&confirm=t"}
+  ]
+}

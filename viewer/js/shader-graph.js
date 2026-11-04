@@ -1,0 +1,435 @@
+// The game's material system in three.js: a costume material names a graphics material (its `shader`,
+// e.g. Avatar_Metal) = a shader template (a graph of operations, from Materials.bin) + the values its
+// operations take (tools/matunpack.py). build_web.py exports them to data/catalog/shaders.json.
+//
+// Each template is compiled once to GLSL: every operation is one block below, written from the game's own
+// HLSL for it (shaders/D3D/ops/*.phl), on vec4 values like the game's assembler. Inputs an edge doesn't
+// feed become uniforms (material value, else the template's fixed value, else the operation's default),
+// so materials sharing a template share the program. The graph's Output feeds the lighting:
+//   albedo  = LitColor;  reflection_weight = ReflectionWeight (1 - ReflectionAddPercent),
+//             add = ReflectionWeight ReflectionAddPercent,  refl = env(reflect(view, N)) x ReflectionColorMask
+//   albedo  = lerp(albedo, albedo refl, reflection_weight);  unlit = lerp(Unlit, Unlit refl, reflection_weight) + add refl
+// then the game's lighting model (below), or with setGameLighting(false) three's Phong lights:
+//   colour  = albedo (diffuse + ambient) + SpecularValue SpecularColor x pow(dot(L, R), 128 SpecularExponent) + unlit
+// Colours are computed in the game's (gamma) space and converted to linear for output (or for three's lights).
+// The reflection cube is the game's own default, TerrainTest_cube: the game uses it whenever the sky names
+// none, and the creator's (Sky_Player_Costume_Creator) doesn't (sky blending 0xf396c0, material binding
+// 0xfaf4c0). setGameReflections(false) puts back the plain sky / ground gradient used before (kept, not
+// offered on the page).
+// Lighting is the game's own model (Standard.LightingModel, light_inc.hlsl, ops/Output.phl), lit by the
+// creator sky's lights (lighting.json from bin/Skies.bin), in the game's gamma space:
+//   ambient = Ambient + lerp(GroundLight, SkyLight, 0.5 + 0.5 N.up) + SideLight (1 - |N.up|) 0.7
+//   d = N.L wrapped by the material's LightBleed (d bleed.y + bleed.x)
+//   diffuse = Diffuse saturate(d) + SecondaryDiffuse AO saturate(-d)        (L: toward the sun)
+//   colour = albedo diffuse + SpecularValue SpecularColor Specular pow(L.R, exponent)
+//            + ambient AO albedo (1 - saturate(0.4 (diffuse . (0.5, 0.6, 0.5)) exposure)) + unlit
+//   Backlight templates (the 4color masks): unlit *= unlit 0.65 + 0.35 first; then colour *=
+//     1.8 dot(normalize(N - 0.65 screen-up), V) and += Backlight (0.35 + albedo) saturate(-N.V bb.y + bb.x)
+//   on screen: colour x exposure, where exposure = Exposure / lerp(LightRange, 2 x scene luminance,
+//   LightAdaptation) (0xf8d090 / 0xf8cdf0); the scene's luminance is taken as SCENE_LUMINANCE here.
+//   AO is the normal map's own (saturate(N . geometric normal)); reflections are scaled by 1 / exposure.
+// setGameLighting(false) goes back to three's Phong lights with the page's lamps (View > Lighting, unticked).
+// The sun and the reflection map turn with the camera (turnLighting), as the creator's turntable would.
+// Not the game's: screen refraction (drawn as additive over the background), and the runtime values of
+// oscillators / scrolling (1 + A sin / rate x time).
+import * as THREE from 'three';
+import { ddsCubeTexture } from './dds.js';
+import { ASSET_ROOT } from './catalog.js';
+import { REGION_GLSL } from './costume-material.js';
+
+export const graphTime = { value: 0 };  // seconds, advanced by tickShaders()
+export function tickShaders(now) { graphTime.value = (now / 1000) % 3600; }
+
+// What every material reflects (one uniform, shared, so switching it changes them all)
+const ENV = { value: null };
+
+// The game's lights (shared uniforms; filled from data/catalog/lighting.json)
+const SCENE_LUMINANCE = 0.35;  // the auto-exposure's measured brightness, assumed (the creator's backdrop is mid-blue)
+const v3 = () => ({ value: new THREE.Vector3() });
+export const LIGHT = {
+  coGame: { value: false }, coExposure: { value: 1 }, coSunDir: v3(), coTurn: { value: new THREE.Vector2(1, 0) },
+  coAmbient: v3(), coSky: v3(), coGround: v3(), coSide: v3(), coKey: v3(), coSecondary: v3(), coSpecLight: v3(),
+  coBacklight: v3(),
+};
+let lighting = null, useGameLight = true;
+export function setGameLighting(on) { useGameLight = on; LIGHT.coGame.value = on && !!lighting; }
+// The creator turns the character in front of a fixed camera and fixed lights. Here the camera orbits
+// instead, so the sun and the reflection map turn with it about the vertical: turning the view shows each
+// side lit as the creator would. yaw: the camera's direction from the character, in radians (0: in front).
+const sun = new THREE.Vector3(0, 1, 0), UP = new THREE.Vector3(0, 1, 0);  // toward the sun, seen from the front
+let turned = 0;
+export function turnLighting(yaw) {
+  turned = yaw;
+  LIGHT.coTurn.value.set(Math.cos(yaw), Math.sin(yaw));
+  LIGHT.coSunDir.value.copy(sun).applyAxisAngle(UP, yaw);
+}
+// The sun as the player sets it (View > Light), seen from the front: direction in degrees round from the
+// camera (negative: from the viewer's left, ±180: from behind), angle in degrees above level, brightness
+// (x the creator's) and colour (the key light's at full strength, 0-1 RGB in the game's gamma space).
+// The colour tints the specular light by as much as it changes the key's. The other lights stay the creator's.
+const sunSet = { direction: 0, angle: 90, brightness: 1, colour: [1, 1, 1] };
+let sunDefault = null, keyPeak = 1;  // the creator's, once lighting.json has loaded; its key light's brightest channel
+export const getSun = () => ({ ...sunSet, colour: [...sunSet.colour] });
+export function setSun(changes) {
+  Object.assign(sunSet, changes);
+  if (!lighting) return;
+  const d = THREE.MathUtils.degToRad(sunSet.direction), a = THREE.MathUtils.degToRad(sunSet.angle);
+  sun.set(Math.sin(d) * Math.cos(a), Math.sin(a), Math.cos(d) * Math.cos(a));
+  turnLighting(turned);
+  const c = sunSet.colour, b = sunSet.brightness, was = sunDefault.colour;
+  LIGHT.coKey.value.set(...c.map(x => x * keyPeak * b));
+  LIGHT.coSpecLight.value.set(...lighting.specular.map((s, i) => s * (was[i] > 0 ? c[i] / was[i] : c[i]) * b));
+}
+// Resolves to the creator's sun ({ direction, angle, brightness, colour }), or null without lighting.json
+export const lightingReady = fetch('data/catalog/lighting.json').then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))).then(l => {
+  lighting = l;
+  const set = (u, rgb) => LIGHT[u].value.set(...rgb);
+  set('coAmbient', l.ambient); set('coSky', l.skyLight); set('coGround', l.groundLight); set('coSide', l.sideLight);
+  set('coSecondary', l.secondaryDiffuse); set('coBacklight', l.backlight);
+  // toward the sun, from the game's space into the viewer's (which mirrors X), as the reflections
+  const s = new THREE.Vector3(-l.sunDirection[0], l.sunDirection[1], l.sunDirection[2]).normalize();
+  keyPeak = Math.max(...l.diffuse) || 1;
+  sunDefault = { direction: THREE.MathUtils.radToDeg(Math.atan2(s.x, s.z)), angle: THREE.MathUtils.radToDeg(Math.asin(s.y)),
+                 brightness: 1, colour: l.diffuse.map(x => x / keyPeak) };
+  setSun({ ...sunDefault, colour: [...sunDefault.colour] });
+  const a = Math.min(1, Math.max(0, l.lightAdaptation));
+  LIGHT.coExposure.value = l.exposure / (l.lightRange * (1 - a) + 2 * SCENE_LUMINANCE * a);
+  setGameLighting(useGameLight);
+  return { direction: sunDefault.direction, angle: sunDefault.angle, brightness: 1, colour: [...sunDefault.colour] };
+}).catch(e => { console.warn('lighting', e); return null; });
+const GAME_REFLECTION = 'dds/system/cubemaps/TerrainTest_cube.dds';
+let gameCube = null;  // the game's map, once asked for: a promise of the texture (null if it can't be read)
+let useGame = false;
+// The game's reflection map (the default), or the gradient: off, until the map has loaded, or if it can't be read.
+export function setGameReflections(on) {
+  useGame = on;
+  ENV.value = environment();
+  if (!on) return;
+  gameCube ||= fetch(ASSET_ROOT + GAME_REFLECTION)
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+    .then(ddsCubeTexture)
+    .catch(e => { console.warn('reflection map', e); return null; });
+  gameCube.then(t => { if (t && useGame) ENV.value = t; });
+}
+
+// A simple sky / ground cube for reflections (the stand-in from before the game's was found)
+let envCube = null;
+function environment() {
+  if (envCube) return envCube;
+  const faces = [];
+  for (let f = 0; f < 6; f++) {
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const g = c.getContext('2d');
+    const fill = (stops) => { const gr = g.createLinearGradient(0, 0, 0, 64); stops.forEach(([o, col]) => gr.addColorStop(o, col)); g.fillStyle = gr; g.fillRect(0, 0, 64, 64); };
+    if (f === 2) fill([[0, '#c8d4e6'], [1, '#c8d4e6']]);          // +Y sky
+    else if (f === 3) fill([[0, '#2a2622'], [1, '#2a2622']]);     // -Y ground
+    else fill([[0, '#c8d4e6'], [0.45, '#8c9099'], [0.55, '#4a4640'], [1, '#2a2622']]);
+    faces.push(c);
+  }
+  envCube = new THREE.CubeTexture(faces);
+  envCube.colorSpace = THREE.NoColorSpace;
+  envCube.needsUpdate = true;
+  return envCube;
+}
+
+setGameReflections(true);
+
+const V = (x) => `vec4(${[0, 1, 2, 3].map(i => (+(x[i] ?? x[x.length - 1] ?? 0)).toFixed(6)).join(', ')})`;
+
+// GLSL for each operation type: (i: input -> vec4 expression, o: output -> variable, u: extra) -> code
+const OPS = {
+  add: (i, o) => `${o.result} = ${i.a} + ${i.b};`,
+  subtract: (i, o) => `${o.result} = ${i.a} - ${i.b};`,
+  subtract_ignorealpha: (i, o) => `${o.result} = vec4(${i.a}.xyz - ${i.b}.xyz, 1.0);`,
+  multiply: (i, o) => `${o.result} = ${i.a} * ${i.b};`,
+  multiplyadd: (i, o) => `${o.result} = ${i.input} * ${i.scale} + ${i.offset};`,
+  clamp: (i, o) => `${o.result} = clamp(${i.a}, 0.0, 1.0);`,
+  invert: (i, o) => `${o.result} = 1.0 - ${i.a};`,
+  slider: (i, o) => `${o.result} = ${i.a};`,
+  colorvalue: (i, o) => `${o.result} = ${i.color};`,
+  color0: (i, o) => `${o.color0} = ${i.defaultinput};`,
+  texcoord0: (i, o) => `${o.texcoord0} = ${i.defaultinput};`,
+  characterbacklightcolor: (i, o) => `${o.result} = vec4(coBacklight, 1.0);`,  // the sky's character backlight
+  lerp: (i, o) => `${o.result} = mix(${i.b}, ${i.a}, ${i.weight});`,
+  lerp_ignorealpha: (i, o) => `${o.result} = vec4(mix(${i.b}, ${i.a}, ${i.weight}).xyz, 1.0);`,
+  lerp4: (i, o) => `{ vec4 w = ${i.weight}; ${o.result} = w.x * ${i.a} + w.y * ${i.b} + w.z * ${i.c} + w.w * ${i.d}; }`,
+  normalize: (i, o) => `{ vec4 n = ${i.normal}; ${o.result} = vec4(normalize(n.xyz), n.w); }`,
+  maskcombine: (i, o) => `{ vec4 t = ${i.tintcolormap}; float w0 = clamp(1.0 - dot(t.xyz, vec3(1.0)), 0.0, 1.0);
+    ${o.result} = vec4(clamp(dot(vec4(t.xyz, w0), ${i.weight}), 0.0, 1.0)); }`,
+  colortint4b: (i, o) => `{ vec4 t = ${i.tintcolormap}, d = ${i.diffuse}; float w0 = clamp(1.0 - dot(t.xyz, vec3(1.0)), 0.0, 1.0);
+    vec4 r = w0 * ${i.color0} + t.x * ${i.color1} + t.y * ${i.color2} + t.z * ${i.color3};
+    r = mix(vec4(1.0), r, ${i.tintmask}); ${o.result} = vec4((d * r).xyz, d.w);
+    if (!coHasRegion) { coRegion = coRegionColour(t, ${i.tintmask}.x); coSlot = coRegionSlot(t, ${i.tintmask}.x); coHasRegion = true; } }`,
+  colortint4b_ignorealpha: (i, o) => `{ vec4 t = ${i.tintcolormap}, d = ${i.diffuse}; float w0 = clamp(1.0 - dot(t.xyz, vec3(1.0)), 0.0, 1.0);
+    vec3 r = w0 * ${i.color0}.xyz + t.x * ${i.color1}.xyz + t.y * ${i.color2}.xyz + t.z * ${i.color3}.xyz;
+    r = mix(vec3(1.0), r, ${i.tintmask}.xyz); ${o.result} = vec4(d.xyz * r, 1.0);
+    if (!coHasRegion) { coRegion = coRegionColour(t, ${i.tintmask}.x); coSlot = coRegionSlot(t, ${i.tintmask}.x); coHasRegion = true; } }`,
+  lightbleedtransform: (i, o) => `{ float l = ${i.lightbleed}.x; float y = 1.0 / (1.0 + l); ${o.result} = vec4(y * l, y, y, y); }`,
+  fresnelterm_advanced: (i, o) => `{ float d = dot(coTS(${i.normal}.xyz), coView); ${o.result} = vec4(pow(clamp(1.0 - abs(d), 0.0, 1.0), ${i.tightness}.x)); }`,
+  specular: (i, o) => `${o.speccolor} = ${i.specularcolor}; ${o.specexponent} = vec4(${i.specularexponent}.x);`,
+  specular_withvalue: (i, o) => `${o.speccolor} = ${i.specularcolor}; ${o.specexponent} = vec4(${i.specularexponent}.x); ${o.specvalue} = vec4(${i.specularvalue}.x);`,
+  normaladd: (i, o) => `{ vec3 tn = ${i.tangentnormal}.xyz; vec4 dn = ${i.detailnormal};
+    vec3 b = vec3(0.0, 1.0, 0.0), t = cross(b, tn); b = cross(tn, t);
+    ${o.result} = vec4(normalize(t * dn.x + b * dn.y + tn * dn.z), dn.w); }`,
+  // the materials store OscillatorValue 1 (its idle value); amplitude 0 (most of them) keeps it there
+  oscillator: (i, o) => `${o.result} = vec4(1.0 + ${i.amplitude}.x * sin(6.2831853 * ${i.frequency}.x * coTime + ${i.phase}.x));`,
+  timegradient: (i, o) => `${o.result} = vec4(${i.maximum}.x);`,
+  overlay: (i, o) => `{ vec4 a = ${i.a}, b = ${i.b}; vec4 comp = vec4(lessThan(b, vec4(0.49999)));
+    ${o.result} = vec4(mix(1.0 - 2.0 * (1.0 - b) * (1.0 - a), 2.0 * b * a, comp).xyz, 1.0); }`,
+  refract: (i, o) => `${o.result} = vec4(0.0, 0.0, 0.0, 1.0);`,  // the screen behind: drawn additively instead
+  scroll: (i, o) => `${o.result} = vec4(${i.scrollrate}.xy * coTime + ${i.texcoord}.xy, 0.0, 1.0);`,
+  texscrollscale: (i, o) => `${o.result} = vec4(${i.texcoord}.xy * ${i.scale}.xy + ${i.scrollrate}.xy * coTime, 0.0, 0.0);`,
+  texxfrm: (i, o) => `${o.result} = vec4(${i.texcoord}.xy * ${i.transform}.xy + ${i.transform}.zw, 0.0, 0.0);`,
+  texrotate: (i, o) => `{ float a = ${i.rotation}.x + ${i.rotationrate}.x * coTime; vec2 s = ${i.scale}.xy, tc = ${i.texcoord}.xy;
+    ${o.result} = vec4(dot(tc, vec2(cos(a), -sin(a)) * s.x), dot(tc, vec2(sin(a), cos(a)) * s.y), 0.0, 0.0); }`,
+  floor: (i, o) => `{ vec2 f = vec2(${i.floorx}.x, ${i.floory}.x); ${o.result} = vec4(floor(${i.value}.xy / f) * f, 0.0, 0.0); }`,
+  sphericalcoordsvs: (i, o) => `{ vec3 n = coTS(${i.normal}.xyz); vec2 tc = n.xy * vec2(0.5, -0.5) + vec2(0.5, -0.5); ${o.result} = tc.xyyy; }`,
+  texture: (i, o, x) => `${o.result} = texture2D(${x.tex}, ${i.texcoord}.xy);`,
+  'texture_2+': (i, o, x) => `${o.result} = texture2D(${x.tex}, ${i.texcoord}.xy); ${o.result2} = texture2D(${x.tex}, ${i.texcoord2}.xy);`,
+  texturenormal: (i, o, x) => `{ vec4 t = texture2D(${x.tex}, ${i.texcoord}.xy); ${o.result} = vec4(t.xyz * 2.0 - 1.0, t.w); }`,
+  texturenormaldxt5nm: (i, o, x) => `{ vec4 t = texture2D(${x.tex}, ${i.texcoord}.xy);
+    vec2 xy = t.wy * 2.0 - 1.0; vec4 nm = vec4(xy, sqrt(max(0.0, 1.0 - dot(xy, xy))), ${i.alphaifdxt5nm}.x);
+    ${o.result} = mix(vec4(t.xyz * 2.0 - 1.0, t.w), nm, ${i.isdxt5nm}.x); }`,
+};
+const TEXTURE_INPUT = { texture: 'texture', 'texture_2+': 'texture', texturenormal: 'normalmap', texturenormaldxt5nm: 'normalmap' };
+
+// Output inputs and their defaults (shaders/Operations/Output.op)
+const OUTPUT_DEFAULTS = {
+  litcolor: [0, 0, 0, 1], alpha: [1, 1, 1, 1], normal: [0, 0, 1, 0], specularcolor: [1, 1, 1, 1], specularvalue: [0, 0, 0, 0],
+  specularexponent: [0.0625, 0, 0, 0], unlitcolor: [0, 0, 0, 0], alpharef: [0.6, 0, 0, 0], reflectionweight: [0, 0, 0, 0],
+  reflectioncolormask: [1, 1, 1, 1], reflectionaddpercent: [0, 0, 0, 0],
+  lightbleed: [0, 1, 0, 0], backlightcolor: [0, 0, 0, 0], backlightbleed: [0, 1, 0, 0],
+};
+
+const compiled = new Map();  // template name -> program description
+
+// Compile a template: GLSL for the graph, plus the uniforms it needs (name -> {op, input, init}) and its
+// texture slots (uniform name -> {op, input}).
+export function compileTemplate(shaders, name) {
+  if (compiled.has(name)) return compiled.get(name);
+  const t = shaders.templates[name], defs = shaders.ops;
+  const byName = new Map(t.ops.map((op, k) => [op.name, { ...op, k }]));
+  const out = t.ops.find(op => op.type === 'output');
+  const uniforms = {}, textures = {}, lines = [], done = new Set(), declared = [];
+  const varOf = (op, output) => `g${op.k}_${output.replace(/[^a-z0-9]/g, '')}`;
+  // takes the costume colours itself (a Color0 input, or the Color1..3 ColorValues the costume code sets)?
+  let usesColors = t.ops.some(op => /^color[123]$/.test(op.name));
+  const visit = (op) => {
+    if (done.has(op.name)) return; done.add(op.name);
+    const def = defs[op.type] || { inputs: {}, outputs: {} };
+    const inputs = {};
+    const names = new Set([...Object.keys(def.inputs), ...Object.keys(op.in), ...Object.keys(op.fixed)]);
+    for (const input of names) {
+      const edge = op.in[input];
+      if (edge && byName.has(edge[0])) {
+        const src = byName.get(edge[0]); visit(src);
+        inputs[input] = varOf(src, edge[1]) + (edge[2] !== 'xyzw' ? '.' + edge[2] : '');
+        continue;
+      }
+      const d = def.inputs[input]?.default;
+      if (d?.type === 'TexCoord0') { inputs[input] = 'vec4(vNormalMapUv, 0.0, 0.0)'; continue; }
+      if (d?.type === 'Color0') { inputs[input] = 'coColor0'; usesColors = true; continue; }
+      if (TEXTURE_INPUT[op.type] === input) continue;
+      const u = `u${op.k}_${input.replace(/[^a-z0-9]/g, '')}`;
+      uniforms[u] = { op: op.name, input, init: op.fixed[input] || d?.floats || [0] };
+      inputs[input] = u;
+    }
+    const outs = {};
+    for (const o of Object.keys(def.outputs).length ? Object.keys(def.outputs) : ['result']) { outs[o] = varOf(op, o); declared.push(outs[o]); }
+    const x = {};
+    if (TEXTURE_INPUT[op.type]) { x.tex = `t${op.k}`; textures[x.tex] = { op: op.name, type: op.type, input: TEXTURE_INPUT[op.type] }; }
+    const gen = OPS[op.type];
+    const proxy = new Proxy(inputs, { get: (o, k) => o[k] ?? 'vec4(0.0)' });
+    lines.push(gen ? gen(proxy, new Proxy(outs, { get: (o, k) => o[k] ?? 'coDiscard' }), x) : `// unsupported ${op.type}`);
+    if (!gen) console.warn('shader op not supported:', op.type, 'in', name);
+  };
+  const outIn = {};
+  for (const [k, init] of Object.entries(OUTPUT_DEFAULTS)) {
+    const edge = out.in[k];
+    if (edge && byName.has(edge[0])) {
+      const src = byName.get(edge[0]); visit(src);
+      outIn[k] = varOf(src, edge[1]) + (edge[2] !== 'xyzw' ? '.' + edge[2] : '');
+    } else outIn[k] = V(out.fixed[k] || init);
+  }
+  const hasRefract = t.ops.some(op => op.type === 'refract');
+  const prog = {
+    name, uniforms, textures, flags: t.flags, reflection: t.reflection, hasRefract, usesColors,
+    backlight: !!out.in.backlightcolor,  // the templates with the Backlight define (the 4color masks) feed it
+    alphaConnected: !!out.in.alpha,
+    glsl: `vec4 coDiscard; vec4 ${[...new Set(declared)].join(', ')};\n${lines.join('\n')}\n` +
+      Object.entries(outIn).map(([k, e]) => `vec4 co_${k} = ${e};`).join('\n'),
+    uniformDecl: [...Object.keys(uniforms).map(u => `uniform vec4 ${u};`), ...Object.keys(textures).map(s => `uniform sampler2D ${s};`)].join('\n'),
+  };
+  compiled.set(name, prog);
+  return prog;
+}
+
+// A material for one costume shader. The returned material's userData.graph = { prog, uniforms } where
+// uniforms[name] is the three.js uniform object (set values with setGraphValue / setGraphTexture).
+export function createGraphMaterial(shaders, shaderName) {
+  const def = shaders.materials[shaderName];
+  if (!def) return null;
+  const prog = compileTemplate(shaders, def.template);
+  const gfx = def.gfxFlags || 0;
+  const mat = new THREE.MeshPhongMaterial({ side: gfx & 4 ? THREE.DoubleSide : THREE.FrontSide });
+  const additive = gfx & 1 || prog.hasRefract;
+  const blended = additive || prog.flags & 32 || (prog.flags & 2 && prog.alphaConnected);
+  if (blended) {
+    mat.transparent = true;
+    if (additive) {  // add light, leave the canvas alpha alone (the page's backdrop shows through the canvas)
+      Object.assign(mat, { blending: THREE.CustomBlending, blendEquation: THREE.AddEquation,
+                           blendSrc: THREE.SrcAlphaFactor, blendDst: THREE.OneFactor,
+                           blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor });
+    }
+  }
+  // blended or not, only NoZWrite materials leave the depth buffer alone; the rest write it, so nearer
+  // pieces of an ice or glass body hide farther ones whatever order the parts are drawn in
+  mat.depthWrite = !(gfx & 8);
+  mat.normalMap = FLAT_NORMAL;  // turns on three's tangent frame (tbn); the graph supplies the normal
+  const u = {
+    coTime: graphTime, coColor0: { value: new THREE.Vector4(1, 1, 1, 1) }, coTint: { value: new THREE.Vector4(1, 1, 1, 1) },
+    coEnv: ENV, ...LIGHT,
+    coRawMask: { value: false }, coNormals: { value: true }, coPick: { value: 0 },  // coPick: the colour dropper (pick.js)
+  };
+  for (const [name, spec] of Object.entries(prog.uniforms)) {
+    const v = def.values[spec.op]?.[spec.input];
+    const init = Array.isArray(v) ? v : spec.init;
+    u[name] = { value: new THREE.Vector4(...[0, 1, 2, 3].map(k => +(init[k] ?? init[init.length - 1] ?? 0))) };
+  }
+  for (const name of Object.keys(prog.textures)) u[name] = { value: WHITE };
+  mat.userData.graph = { prog, def, uniforms: u, blended, additive };
+  mat.customProgramCacheKey = () => 'cograph:' + prog.name + (mat.userData.graph.noNormals ? ':nn' : '') + (additive ? ':add' : '');
+  mat.onBeforeCompile = shader => {
+    Object.assign(shader.uniforms, u);
+    const noNormals = mat.userData.graph.noNormals;
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+        uniform float coTime, coPick; uniform vec4 coColor0, coTint; uniform samplerCube coEnv; uniform bool coRawMask;
+        uniform bool coGame; uniform float coExposure; uniform vec2 coTurn; uniform vec3 coSunDir, coAmbient, coSky, coGround, coSide, coKey,
+          coSecondary, coSpecLight, coBacklight;
+        ${prog.uniformDecl}
+        vec3 coSRGBToLinear( vec3 c ) { c = max(c, 0.0); return mix( c / 12.92, pow( ( c + 0.055 ) / 1.055, vec3( 2.4 ) ), step( 0.04045, c ) ); }
+        vec3 coLit; float coAlpha; vec3 coSpecColor; float coSpecExp;
+        vec3 coRegion; bool coHasRegion; float coSlot;  // Colour regions and the dropper: the first colour tint's (REGION_GLSL)
+        ${REGION_GLSL}`)
+      .replace('#include <map_fragment>', '')
+      .replace('#include <normal_fragment_maps>', `
+        vec3 coView = normalize( vViewPosition );
+        ${noNormals ? '' : '#define CO_USE_TBN'}
+        #define coTS(n) ${noNormals ? 'normal' : 'normalize( tbn * (n) )'}
+        coHasRegion = false;
+        ${prog.glsl}
+        ${noNormals ? '' : 'normal = coTS( co_normal.xyz );'}
+        float coReflW = co_reflectionweight.x * ( 1.0 - clamp( co_reflectionaddpercent.x, 0.0, 1.0 ) );
+        float coReflAdd = co_reflectionweight.x * clamp( co_reflectionaddpercent.x, 0.0, 1.0 );
+        vec3 coRefl = vec3( 0.0 );
+        // the reflection direction in world space, then in the game's (left-handed: the viewer mirrors X)
+        ${prog.reflection ? `{ vec3 r = ( vec4( reflect( -coView, normal ), 0.0 ) * viewMatrix ).xyz;
+          r = vec3( coTurn.x * r.x - coTurn.y * r.z, r.y, coTurn.y * r.x + coTurn.x * r.z );  // the map turned with the view
+          coRefl = textureCube( coEnv, vec3( -r.x, r.yz ) ).rgb * co_reflectioncolormask.xyz; }` : 'coReflW = 0.0; coReflAdd = 0.0;'}
+        vec3 coUnlitIn = co_unlitcolor.xyz;
+        if ( coGame ) {
+          coRefl /= coExposure;  // reflections are in the exposure's light units (Output.phl InvToneMapLDR)
+          ${prog.backlight ? 'coUnlitIn *= coUnlitIn * 0.65 + 0.35;  // Backlight templates' : ''}
+        }
+        vec3 coAlbedo = mix( co_litcolor.xyz, co_litcolor.xyz * coRefl, coReflW );
+        vec3 coUnlit = mix( coUnlitIn, coUnlitIn * coRefl, coReflW ) + coReflAdd * coRefl;
+        coAlpha = clamp( co_alpha.w, 0.0, 1.0 );
+        ${prog.flags & 2 || mat.transparent ? '' : 'if ( coAlpha < co_alpharef.x ) discard; coAlpha = 1.0;'}
+        // the draw's tint colour (Output.phl: unlit and albedo times v.color0, alpha times its alpha)
+        coAlbedo *= coTint.rgb; coUnlit *= coTint.rgb; coAlpha *= coTint.a;
+        // Colour regions: flat, lit for the shape, no glow or reflection. A template without costume colours
+        // (the Fx materials) is tinted whole by colour 1.
+        ${prog.usesColors ? '' : 'coRegion = coRegionColour( vec4( 0.0 ), 1.0 ); coSlot = 0.0; coHasRegion = true;'}
+        if ( coRawMask && coHasRegion ) { coAlbedo = coRegion; coUnlit = vec3( 0.0 ); }
+        diffuseColor = vec4( coSRGBToLinear( coAlbedo ), coAlpha );
+        totalEmissiveRadiance += coSRGBToLinear( coUnlit );
+        coSpecColor = coRawMask && coHasRegion ? vec3( 0.0 ) : co_specularvalue.x * co_specularcolor.xyz;
+        coSpecExp = clamp( co_specularexponent.x * 128.0, 0.25, 128.0 );`)
+      .replace('#include <lights_phong_fragment>', `BlinnPhongMaterial material;
+        material.diffuseColor = diffuseColor.rgb; material.specularColor = coSpecColor;
+        material.specularShininess = coSpecExp; material.specularStrength = 1.0;`)
+      .replace('#include <lights_phong_pars_fragment>', PHONG_PARS)
+      .replace('#include <opaque_fragment>', `
+        if ( coGame ) {  // the game's lighting model (see the top of shader-graph.js), in its gamma space
+          vec3 N = normal, V = coView, R = reflect( -coView, N );  // coView: toward the eye
+          vec3 Ng = normalize( vNormal );
+          #ifdef DOUBLE_SIDED
+            Ng *= faceDirection;
+          #endif
+          float ao = clamp( dot( N, Ng ), 0.0, 1.0 );
+          vec3 L = normalize( ( viewMatrix * vec4( coSunDir, 0.0 ) ).xyz );
+          float up = dot( N, normalize( ( viewMatrix * vec4( 0.0, 1.0, 0.0, 0.0 ) ).xyz ) );
+          vec3 amb = coAmbient + mix( coGround, coSky, up * 0.5 + 0.5 ) + coSide * ( 1.0 - abs( up ) ) * 0.7;
+          float d = dot( N, L ) * co_lightbleed.y + co_lightbleed.x;
+          vec3 diff = coKey * clamp( d, 0.0, 1.0 ) + coSecondary * ao * clamp( -d, 0.0, 1.0 );
+          float spec = pow( clamp( dot( L, R ), 0.0, 1.0 ), coSpecExp );
+          float fade = 1.0 - clamp( 0.4 * dot( diff, vec3( 0.5, 0.6, 0.5 ) ) * coExposure, 0.0, 1.0 );
+          vec3 c = coAlbedo * diff + coSpecColor * coSpecLight * spec + amb * ao * coAlbedo * fade + coUnlit;
+          ${prog.backlight ? `c *= dot( normalize( N + vec3( 0.0, -0.65, 0.0 ) ), V ) * 1.8;
+          c += coBacklight * ( 0.35 + coAlbedo ) * clamp( -dot( N, V ) * co_backlightbleed.y + co_backlightbleed.x, 0.0, 1.0 );` : ''}
+          outgoingLight = coSRGBToLinear( c * coExposure );
+        }
+        #include <opaque_fragment>`)
+      // a template without a colour tint has no slots: 5, nothing to take
+      .replace('#include <dithering_fragment>', `#include <dithering_fragment>
+        CO_PICK_OUTPUT( coHasRegion ? coSlot : 5.0 )`);
+  };
+  return mat;
+}
+
+// three's Blinn-Phong with the game's specular term: pow(dot(L, reflect(-V, N)), exponent), unnormalised,
+// scaled by 1/pi like three's Lambert diffuse so the two keep the game's ratio.
+const PHONG_PARS = /* glsl */`
+varying vec3 vViewPosition;
+struct BlinnPhongMaterial { vec3 diffuseColor; vec3 specularColor; float specularShininess; float specularStrength; };
+void RE_Direct_BlinnPhong( const in IncidentLight directLight, const in vec3 geometryPosition, const in vec3 geometryNormal, const in vec3 geometryViewDir, const in vec3 geometryClearcoatNormal, const in BlinnPhongMaterial material, inout ReflectedLight reflectedLight ) {
+  float dotNL = saturate( dot( geometryNormal, directLight.direction ) );
+  reflectedLight.directDiffuse += dotNL * directLight.color * BRDF_Lambert( material.diffuseColor );
+  vec3 r = reflect( -geometryViewDir, geometryNormal );
+  float s = pow( saturate( dot( directLight.direction, r ) ), material.specularShininess ) * step( 0.0001, dotNL );
+  reflectedLight.directSpecular += directLight.color * s * material.specularColor * RECIPROCAL_PI;
+}
+void RE_IndirectDiffuse_BlinnPhong( const in vec3 irradiance, const in vec3 geometryPosition, const in vec3 geometryNormal, const in vec3 geometryViewDir, const in vec3 geometryClearcoatNormal, const in BlinnPhongMaterial material, inout ReflectedLight reflectedLight ) {
+  reflectedLight.indirectDiffuse += irradiance * BRDF_Lambert( material.diffuseColor );
+}
+#define RE_Direct RE_Direct_BlinnPhong
+#define RE_IndirectDiffuse RE_IndirectDiffuse_BlinnPhong
+`;
+
+function pixel(r, g, b, a) {
+  const t = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1, THREE.RGBAFormat);
+  t.needsUpdate = true; return t;
+}
+const WHITE = pixel(255, 255, 255, 255);
+const FLAT_NORMAL = pixel(128, 128, 255, 255);
+const BLACK_MASK = pixel(0, 0, 0, 255);
+export const GRAPH_DEFAULTS = { white: WHITE, flatNormal: FLAT_NORMAL, blackMask: BLACK_MASK };
+
+// set a constant by operation name (e.g. 'color1', 'reflectionweight') if the template has it
+export function setGraphValue(mat, op, input, v4) {
+  const g = mat.userData.graph;
+  for (const [name, spec] of Object.entries(g.prog.uniforms)) if (spec.op === op && spec.input === input) g.uniforms[name].value.set(...v4);
+}
+// the placeholder texture name each texture slot uses in this material (lower case)
+export function graphTextureSlots(mat) {
+  const g = mat.userData.graph;
+  return Object.entries(g.prog.textures).map(([slot, spec]) => ({ slot, op: spec.op, placeholder: (g.def.values[spec.op]?.[spec.input] || '').toLowerCase() }));
+}
+// texture slots of a costume shader before any material exists: [{slot, placeholder}]
+export function shaderTextureSlots(shaders, shaderName) {
+  const def = shaders.materials[shaderName];
+  if (!def) return [];
+  const prog = compileTemplate(shaders, def.template);
+  return Object.entries(prog.textures).map(([slot, spec]) => ({ slot, placeholder: (def.values[spec.op]?.[spec.input] || '').toLowerCase() }));
+}
+// TextureNormalDXT5nm's IsDXT5nm is the engine's, from the bound texture (TextureNormal_IsDXT5nm, hidden in the
+// material editor): the 1 the materials store is their placeholder's. Costume normal maps are uncompressed RGB,
+// whose missing alpha read as X tipped every normal onto the (per-triangle) tangent: faceted, dark Brushed and
+// Shiny Metal. The game's only DXT5nm texture is a DXT5 file, so a DXT5 normal map counts as one.
+export function setGraphTexture(mat, slot, tex, fallback = WHITE) {
+  const g = mat.userData.graph, t = tex || fallback, spec = g.prog.textures[slot];
+  g.uniforms[slot].value = t;
+  if (spec?.type === 'texturenormaldxt5nm')
+    setGraphValue(mat, spec.op, 'isdxt5nm', [t.isCompressedTexture && t.format === THREE.RGBA_S3TC_DXT5_Format ? 1 : 0, 0, 0, 0]);
+}

@@ -1,0 +1,8 @@
+{
+  "_comment": "Where publish_release.py puts a release. The Drive IDs are the stable files in drive_folder (overwritten each release, so the IDs never change); update_sources.json uses drive_manifest_id.",
+  "github": "NeroBlackFang/co-character-creator",
+  "codeberg": "{codeberg_owner}/co-character-creator",
+  "drive_folder": "G:\\My Drive\\CO Costume Editor",
+  "drive_manifest_id": "1r-xF_CYejoJOThirFw-3IaiOOIbsWODc",
+  "drive_installer_id": "1DSyed6HP-xwT2t2DDaNaD1SEbsnv7K2e"
+}

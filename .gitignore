@@ -1,0 +1,16 @@
+# made on each machine from the game, or by builds
+catalog/
+index/
+viewer/data/
+viewer/ui/
+settings.json
+my_costumes/
+captions/batches.json
+.claude/settings.local.json
+dist/
+python/
+__pycache__/
+*.pyc
+# install-only files
+installed.ini
+unins000.*

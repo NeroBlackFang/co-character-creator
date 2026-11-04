@@ -1,0 +1,114 @@
+diff -ruN a/build.py b/build.py
+--- a/build.py	2026-11-03 02:32:27.973176362 +0000
++++ b/build.py	2026-11-03 02:32:27.980859498 +0000
+@@ -26,7 +26,7 @@
+ from paths import data  # noqa: E402
+ 
+ BUILD_INFO = data('viewer', 'data', 'build.json')
+-VERSION = 6  # bump when the build's output changes, to force a rebuild (5: lighting.json, the creator sky's lights; 6: no vehicle bike in the index)
++VERSION = 7  # bump when the build's output changes, to force a rebuild (5: lighting.json, the creator sky's lights; 6: no vehicle bike in the index; 7: Flat detail texture kept in every catalog)
+ 
+ 
+ PACKAGES = {'PIL': 'Pillow', 'numpy': 'numpy'}  # import name -> pip name; also in requirements.txt
+diff -ruN a/build_web.py b/build_web.py
+--- a/build_web.py	2026-11-03 02:32:27.973302976 +0000
++++ b/build_web.py	2026-11-03 02:32:27.980990461 +0000
+@@ -237,6 +237,7 @@
+                         'muscle': dds_url(muscle), 'order': m['order']}
+         used_tex.update(m['textures'])
+         used_tex.update(v for v in m['defaults'].values() if v)
++    used_tex.add('C_Default_Detail')  # "Flat": drawn for a part whose Detail is empty (viewer/js/catalog.js textureSwaps)
+     out_tex = {}
+     for tn in sorted(used_tex):
+         t = texs.get(tn)
+diff -ruN a/costume_check.py b/costume_check.py
+--- a/costume_check.py	2026-11-03 02:32:27.973360279 +0000
++++ b/costume_check.py	2026-11-03 02:32:27.981029355 +0000
+@@ -219,6 +219,12 @@
+ 
+             # textures
+             for key, kind in TEXTURE_KINDS.items():
++                if key == 'detail':
++                    if str(p.get(key) or '').strip().lower() in ('none', 'no detail'):
++                        continue  # an empty Detail is None: no detail is drawn (not the material's default)
++                    if not p.get(key) and md.get('defaults', {}).get('detail'):
++                        part['detail'] = md['defaults']['detail']  # left out: the material's default, as the tailor picks it
++                        continue
+                 if p.get(key):
+                     opts = [t for t in md.get('textures', []) if t in T and kind in T[t]['type']]
+                     tl = {t: T[t].get('displayName') for t in opts}
+diff -ruN a/index_guide.md b/index_guide.md
+--- a/index_guide.md	2026-11-03 02:32:27.974143738 +0000
++++ b/index_guide.md	2026-11-03 02:32:27.981205761 +0000
+@@ -112,7 +112,7 @@
+ - **`parts[].geometry`** (required): the piece's internal name (the `code` after the name in the slot files).
+   - `bone` is optional: it comes from the piece.
+   - Leave out required slots and they're filled.
+-- **`material`, `pattern`, `detail`, `diffuse`, `specular`** (optional): internal names, or a display name when it's unambiguous for that piece ("Leather", "Tights Leather"). Leave them out for the defaults.
++- **`material`, `pattern`, `detail`, `diffuse`, `specular`** (optional): internal names, or a display name when it's unambiguous for that piece ("Leather", "Tights Leather"). Leave them out for the defaults. `"detail": "none"` draws no detail at all (a Beast skin's Briefs Smooth default is what you get when `detail` is left out).
+ - **`colors`:** four colours as `"#rrggbb"`, a CSS colour name (`"crimson"`) or `[r, g, b]`.
+   - At the top level, `colors` is the costume's scheme.
+   - On a part, it gives that part its own colours.
+diff -ruN a/viewer/js/catalog.js b/viewer/js/catalog.js
+--- a/viewer/js/catalog.js	2026-11-03 02:32:27.978969250 +0000
++++ b/viewer/js/catalog.js	2026-11-03 02:32:27.983764163 +0000
+@@ -52,7 +52,9 @@
+ const KINDS = { pattern: 'Pattern', diffuse: 'Diffuse', detail: 'Detail', specular: 'Specular' };
+ export function drawnTexture(cat, part, m, field) {
+   if (part[field]) return part[field];
+-  if (m?.defaults?.[field]) return m.defaults[field];
++  // the game draws no Detail for an empty one (the tailor shows "None"; saved files leave the field out), so
++  // only a pattern / diffuse / specular falls back to the material's default
++  if (field !== 'detail' && m?.defaults?.[field]) return m.defaults[field];
+   if (!m?.requires?.includes(field)) return '';
+   return (m.textures || []).find(t => cat.textures[t]?.type.includes(KINDS[field])) || '';
+ }
+@@ -67,6 +69,10 @@
+     if (!t) continue;
+     for (const e of [...t.extra, t]) if (e.replaces && e.image) swaps.set(e.replaces.toLowerCase(), e.image);
+   }
++  // no Detail: the material's own default one (Briefs Smooth ...) must not show through, so its placeholder is
++  // swapped for the Flat detail (null when this catalog lacks it: nothing is bound)
++  if (m?.defaults?.detail && !drawnTexture(cat, part, m, 'detail'))
++    swaps.set('default_detail_n', cat.textures.C_Default_Detail?.image || null);
+   return swaps;
+ }
+ 
+diff -ruN a/viewer/js/character.js b/viewer/js/character.js
+--- a/viewer/js/character.js	2026-11-03 02:32:27.978983671 +0000
++++ b/viewer/js/character.js	2026-11-03 02:32:27.983776606 +0000
+@@ -221,7 +221,7 @@
+       const shaders = await loadShaders().catch(() => null);
+       const graph = shaders && res.shader && shaders.materials[res.shader] ? shaders : null;
+       const swaps = graph ? textureSwaps(this.cat, part) : null;
+-      const slots = graph ? shaderTextureSlots(graph, res.shader).map(s => ({ ...s, image: swaps.get(s.placeholder) || graph.images[s.placeholder] || null })) : [];
++      const slots = graph ? shaderTextureSlots(graph, res.shader).map(s => ({ ...s, image: swaps.has(s.placeholder) ? swaps.get(s.placeholder) : graph.images[s.placeholder] || null })) : [];
+       const [loaded, mask, diffuse, detail, muscle, ...slotTex] = await Promise.all([
+         loadMesh(res.mesh, res.model), ...['mask', 'diffuse', 'detail', 'muscle'].map(k => graph ? null : loadTexture(res.images[k])),
+         ...slots.map(s => loadTexture(s.image))]);
+diff -ruN a/viewer/js/parts-panel.js b/viewer/js/parts-panel.js
+--- a/viewer/js/parts-panel.js	2026-11-03 02:32:27.979164893 +0000
++++ b/viewer/js/parts-panel.js	2026-11-03 02:32:27.983955882 +0000
+@@ -477,7 +477,7 @@
+     const mat = partMaterial(cat, part);
+     const mats = materialsFor(cat, part.geometry, { ...this.opts }).map(([n, m]) => ({ value: n, label: m.displayName || n, data: m }));
+     if (mat && !mats.some(m => m.value === mat.name)) mats.unshift({ value: mat.name, label: mat.displayName || mat.name, data: mat });
+-    if (mats.length > 1) box.append(this.cycler('Material', mats, mat?.name, v => setField({ material: v, pattern: '', detail: '', diffuse: '', specular: '' }), { cls: 'sub', title: 'materials' }));
++    if (mats.length > 1) box.append(this.cycler('Material', mats, mat?.name, v => setField({ material: v, pattern: '', detail: cat.materials[v]?.defaults?.detail || '', diffuse: '', specular: '' }), { cls: 'sub', title: 'materials' }));
+     if (mat) {
+       for (const [kind, field] of [['Pattern', 'pattern'], ['Detail', 'detail'], ['Diffuse', 'diffuse'], ['Specular', 'specular']]) {
+         const list = texturesFor(cat, mat.name, kind, this.opts).map(([n, t]) => ({ value: n, label: t.displayName || n, data: t }));
+diff -ruN a/viewer/js/rules.js b/viewer/js/rules.js
+--- a/viewer/js/rules.js	2026-11-03 02:32:27.979237163 +0000
++++ b/viewer/js/rules.js	2026-11-03 02:32:27.984028071 +0000
+@@ -85,7 +85,9 @@
+   const g = cat.geometries[geometry];
+   const material = [g.defaultMaterial, ...g.materials].find(m => m && cat.materials[m] && !isDev(cat.materials[m]))
+     || [g.defaultMaterial, ...g.materials].find(m => m && cat.materials[m]) || '';
+-  return { bone, geometry, material, pattern: '', detail: '', diffuse: '', specular: '',
++  // like the game's tailor, a new piece starts on its material's default Detail (the Beast skin's Briefs Smooth);
++  // an empty Detail is "None" and draws no detail
++  return { bone, geometry, material, pattern: '', detail: cat.materials[material]?.defaults?.detail || '', diffuse: '', specular: '',
+            colors: (look.colors || DEFAULT_COLORS).map(c => [...c]), glow: [...(look.glow || [0, 0, 0, 0])],
+            colorLink: look.colorLink ?? 1 };
+ }
