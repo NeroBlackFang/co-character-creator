@@ -1,0 +1,13 @@
+{
+  "version": "0.7.1",
+  "file": "CO-Costume-Editor-0.7.1-Setup.exe",
+  "size": 26697254,
+  "sha256": "e515565ba89d24169db42fd1b0f4c5b467ebd67ecf76a4e64801dfdcfcf97f91",
+  "notes": "https://github.com/NeroBlackFang/co-character-creator/releases/tag/v0.7.1",
+  "summary": "Bug fixes, and the editor can now update itself: About -> Update downloads the newest installer from GitHub, falling back to Google Drive, checks it and installs it. Your settings and data are kept.",
+  "published": "2026-11-04T03:34:56Z",
+  "downloads": [
+    "https://github.com/NeroBlackFang/co-character-creator/releases/download/v0.7.1/CO-Costume-Editor-0.7.1-Setup.exe",
+    "https://drive.usercontent.google.com/download?id=1DSyed6HP-xwT2t2DDaNaD1SEbsnv7K2e&export=download&confirm=t"
+  ]
+}
